@@ -1,0 +1,80 @@
+{
+  "camera_id": "CAM01",
+  "zone_id": "ZONE_A",
+  "resolution": [1280, 720],
+  "description": "Baseline Parking Bay Configuration",
+  "slots": [
+    {
+      "slot_id": "P01",
+      "camera_id": "CAM01",
+      "zone_id": "ZONE_A",
+      "status": "AVAILABLE",
+      "polygon": [
+        [120, 100],
+        [260, 100],
+        [260, 260],
+        [120, 260]
+      ]
+    },
+    {
+      "slot_id": "P02",
+      "camera_id": "CAM01",
+      "zone_id": "ZONE_A",
+      "status": "AVAILABLE",
+      "polygon": [
+        [300, 100],
+        [440, 100],
+        [440, 260],
+        [300, 260]
+      ]
+    },
+    {
+      "slot_id": "P03",
+      "camera_id": "CAM01",
+      "zone_id": "ZONE_A",
+      "status": "AVAILABLE",
+      "polygon": [
+        [480, 100],
+        [620, 100],
+        [620, 260],
+        [480, 260]
+      ]
+    },
+    {
+      "slot_id": "P04",
+      "camera_id": "CAM01",
+      "zone_id": "ZONE_A",
+      "status": "AVAILABLE",
+      "polygon": [
+        [120, 460],
+        [260, 460],
+        [260, 620],
+        [120, 620]
+      ]
+    },
+    {
+      "slot_id": "P05",
+      "camera_id": "CAM01",
+      "zone_id": "ZONE_A",
+      "status": "AVAILABLE",
+      "polygon": [
+        [300, 460],
+        [440, 460],
+        [440, 620],
+        [300, 620]
+      ]
+    },
+    {
+      "slot_id": "P06",
+      "camera_id": "CAM01",
+      "zone_id": "ZONE_A",
+      "status": "AVAILABLE",
+      "polygon": [
+        [480, 460],
+        [620, 460],
+        [620, 620],
+        [480, 620]
+      ]
+    }
+  ]
+}

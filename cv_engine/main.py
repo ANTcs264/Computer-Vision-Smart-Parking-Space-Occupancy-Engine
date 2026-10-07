@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 """
-Computer Vision Engine - Phase 3 Entry Point
-Camera Ingestion + YOLO Multi-Class Vehicle Detection Pipeline.
-Detects Cars, Motorcycles, Buses, Trucks with Bounding Boxes, Confidence Scores,
-and Real-time Performance Telemetry.
+Computer Vision Engine - Phase 4 Unified Pipeline
+Camera Ingestion + YOLO Multi-Class Detection + Parking Slot Map Overlay.
 """
 
 import argparse
 import logging
+import os
 import sys
 import time
 from pathlib import Path
@@ -25,6 +24,7 @@ from cv_engine.detection import (
     draw_detections,
     get_detection_summary
 )
+from cv_engine.parking import SlotManager, DEFAULT_SLOTS_FILE
 
 # Configure structured logging
 logging.basicConfig(
@@ -40,16 +40,17 @@ def run_pipeline(
     width: int = 1280,
     height: int = 720,
     frame_skip: int = 0,
-    model_path: str = "yolov8n.pt",
+    model_path: str = "models/yolo/yolov8n.pt",
     conf_thresh: float = 0.45,
     iou_thresh: float = 0.45,
     image_size: int = 640,
+    slots_path: str | None = str(DEFAULT_SLOTS_FILE),
     enable_detection: bool = True,
     headless: bool = False,
     max_frames: int = 0
 ):
     """
-    Main CV processing loop integrating Camera Ingestion and YOLO Detection.
+    Main CV processing loop integrating Camera, YOLO Detection, and Parking Slot Overlays.
     """
     # 1. Initialize Camera Configuration
     cam_config = CameraConfig.from_env()
@@ -73,7 +74,7 @@ def run_pipeline(
             )
             cam_config.source = str(sample_video_path)
 
-    # 2. Initialize Detection Configuration & Model
+    # 2. Initialize YOLO Detector
     detector = None
     if enable_detection:
         det_config = DetectionConfig.from_env()
@@ -84,22 +85,25 @@ def run_pipeline(
         det_config.image_size = image_size
         detector = YOLOVehicleDetector(det_config)
 
+    # 3. Initialize Parking Slot Manager
+    slot_manager = None
+    if slots_path and os.path.isfile(slots_path):
+        slot_manager = SlotManager(slots_path)
+    elif DEFAULT_SLOTS_FILE.is_file():
+        slot_manager = SlotManager(DEFAULT_SLOTS_FILE)
+
     logger.info("=" * 68)
-    logger.info("   SMART PARKING AI - YOLO VEHICLE DETECTION PIPELINE   ")
+    logger.info("   SMART PARKING AI - PHASE 4 CAMERA & PARKING SLOT MAP   ")
     logger.info(f"   Target Source       : {cam_config.source}")
     logger.info(f"   Target Resolution   : {cam_config.width}x{cam_config.height}")
     logger.info(f"   Detection Enabled   : {enable_detection}")
-    if enable_detection and detector:
-        logger.info(f"   YOLO Model Weight   : {detector.config.model_path}")
-        logger.info(f"   Confidence Thresh   : {detector.config.confidence_threshold}")
-        logger.info(f"   NMS IoU Thresh      : {detector.config.iou_threshold}")
-        logger.info(f"   Inference Image Sz  : {detector.config.image_size}")
-        logger.info(f"   Inference Device    : {detector.config.device}")
+    if slot_manager:
+        logger.info(f"   Parking Slots Loaded: {slot_manager.total_count} slots from {slot_manager.config_path.name}")
     logger.info(f"   Display Mode        : {'Headless' if headless else 'Interactive GUI'}")
     logger.info("=" * 68)
 
     fps_meter = FPSMeter(window_size=30)
-    window_name = "Smart Parking AI - YOLO Vehicle Detection (Phase 3)"
+    window_name = "Smart Parking AI - Camera & Parking Slot Map (Phase 4)"
 
     total_inf_time = 0.0
     detected_frames_count = 0
@@ -120,14 +124,19 @@ def run_pipeline(
                     detections = []
                     summary = None
 
-                    # Run YOLO Vehicle Detection
+                    # Step 1: Draw Configured Parking Slot Boundaries
+                    if slot_manager is not None:
+                        slot_manager.draw_slots(frame, alpha=0.30)
+                        slot_manager.draw_slot_kpi_banner(frame)
+
+                    # Step 2: Run YOLO Vehicle Detection
                     if detector is not None:
                         detections, inference_ms = detector.detect(frame)
                         total_inf_time += inference_ms
                         detected_frames_count += 1
                         summary = get_detection_summary(detections)
 
-                        # Draw Bounding Boxes and Labels
+                        # Draw Bounding Boxes and Ground Footprints
                         draw_detections(frame, detections, show_footprint=True)
 
                     # Tick FPS meter & calculate performance
@@ -152,20 +161,20 @@ def run_pipeline(
                     logger.info(f"Reached max frame limit ({max_frames} frames). Terminating test.")
                     break
 
-                # Headless Mode (no OpenCV GUI window created)
+                # Headless Mode (for tests / CI)
                 if headless:
                     if frame_idx % 10 == 0 or frame_idx == 1:
-                        sum_str = f"Vehicles: {summary['total']}" if summary else "No Detection"
+                        slot_info = f"Slots: {slot_manager.total_count}" if slot_manager else "No Slots"
                         logger.info(
                             f"[Headless] Frame: {frame_idx:04d} | FPS: {fps_meter.fps:4.1f} | "
-                            f"Inf: {inference_ms:4.1f}ms | {sum_str}"
+                            f"Inf: {inference_ms:4.1f}ms | {slot_info}"
                         )
                     continue
 
                 # Interactive Mode: Display window via OpenCV
                 cv2.imshow(window_name, annotated_frame)
 
-                # WaitKey timing: ~30 FPS sync or keypress capture
+                # Keyboard controls
                 key = cv2.waitKey(1) & 0xFF
                 if key in (ord('q'), 27):  # 'q' or ESC
                     logger.info("Exit requested by user.")
@@ -188,22 +197,24 @@ def run_pipeline(
     logger.info("=" * 68)
     logger.info(f"Pipeline Completed: {frame_idx} total frames processed.")
     logger.info(f"Average Rolling FPS       : {fps_meter.fps:.2f}")
-    logger.info(f"Average YOLO Inference    : {avg_inf:.2f} ms")
+    if enable_detection:
+        logger.info(f"Average YOLO Inference    : {avg_inf:.2f} ms")
     logger.info(f"Total Session Time        : {fps_meter.uptime_sec:.2f} seconds")
     logger.info("=" * 68)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Smart Parking AI - Phase 3 YOLO Vehicle Detection")
+    parser = argparse.ArgumentParser(description="Smart Parking AI - Phase 4 Parking Slot Map Pipeline")
     parser.add_argument("--source", type=str, default=None, help="Camera device index (0), video path, or RTSP URL")
     parser.add_argument("--width", type=int, default=1280, help="Target frame width (default: 1280)")
     parser.add_argument("--height", type=int, default=720, help="Target frame height (default: 720)")
     parser.add_argument("--skip", type=int, default=0, help="Frames to skip between inferences (default: 0)")
-    parser.add_argument("--model", type=str, default="yolov8n.pt", help="YOLO model path/name (default: yolov8n.pt)")
+    parser.add_argument("--model", type=str, default="models/yolo/yolov8n.pt", help="YOLO model path")
     parser.add_argument("--conf", type=float, default=0.45, help="Confidence threshold (default: 0.45)")
     parser.add_argument("--iou", type=float, default=0.45, help="NMS IoU threshold (default: 0.45)")
     parser.add_argument("--imgsz", type=int, default=640, help="YOLO input image size (default: 640)")
-    parser.add_argument("--no-detect", action="store_true", help="Disable YOLO detection (camera-only mode)")
+    parser.add_argument("--slots", type=str, default=str(DEFAULT_SLOTS_FILE), help="Path to parking_slots.json")
+    parser.add_argument("--no-detect", action="store_true", help="Disable YOLO detection (slot-map-only mode)")
     parser.add_argument("--headless", action="store_true", help="Run in headless mode without GUI window")
     parser.add_argument("--max-frames", type=int, default=0, help="Stop after N frames (default: 0 = infinite)")
 
@@ -217,6 +228,7 @@ def main():
         conf_thresh=args.conf,
         iou_thresh=args.iou,
         image_size=args.imgsz,
+        slots_path=args.slots,
         enable_detection=not args.no_detect,
         headless=args.headless,
         max_frames=args.max_frames

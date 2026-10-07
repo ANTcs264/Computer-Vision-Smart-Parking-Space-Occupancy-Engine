@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-Computer Vision Engine - Phase 2 Entry Point
-Demonstrates Camera Ingestion, Live Video Playback, FPS Metering,
-and Telemetry Rendering via OpenCV.
+Computer Vision Engine - Phase 3 Entry Point
+Camera Ingestion + YOLO Multi-Class Vehicle Detection Pipeline.
+Detects Cars, Motorcycles, Buses, Trucks with Bounding Boxes, Confidence Scores,
+and Real-time Performance Telemetry.
 """
 
 import argparse
@@ -18,6 +19,12 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from cv_engine.camera import CameraConfig, FPSMeter, VideoCamera, draw_telemetry_hud
+from cv_engine.detection import (
+    DetectionConfig,
+    YOLOVehicleDetector,
+    draw_detections,
+    get_detection_summary
+)
 
 # Configure structured logging
 logging.basicConfig(
@@ -33,26 +40,30 @@ def run_pipeline(
     width: int = 1280,
     height: int = 720,
     frame_skip: int = 0,
+    model_path: str = "yolov8n.pt",
+    conf_thresh: float = 0.45,
+    iou_thresh: float = 0.45,
+    image_size: int = 640,
+    enable_detection: bool = True,
     headless: bool = False,
     max_frames: int = 0
 ):
     """
-    Main camera processing loop.
-    Reads frames, calculates FPS, overlays telemetry, and renders to screen or headless sink.
+    Main CV processing loop integrating Camera Ingestion and YOLO Detection.
     """
-    # 1. Initialize Configuration
-    config = CameraConfig.from_env()
+    # 1. Initialize Camera Configuration
+    cam_config = CameraConfig.from_env()
     if source is not None:
-        config.source = int(source) if str(source).isdigit() else str(source)
+        cam_config.source = int(source) if str(source).isdigit() else str(source)
     if width > 0:
-        config.width = width
+        cam_config.width = width
     if height > 0:
-        config.height = height
-    config.frame_skip = frame_skip
+        cam_config.height = height
+    cam_config.frame_skip = frame_skip
 
-    # Fallback to sample video if webcam 0 requested but not available
+    # Fallback to sample parking video if webcam 0 is requested but not available
     sample_video_path = PROJECT_ROOT / "datasets" / "sample_parking.mp4"
-    if config.source == 0:
+    if cam_config.source == 0:
         test_cap = cv2.VideoCapture(0)
         is_webcam_open = test_cap.isOpened()
         test_cap.release()
@@ -60,21 +71,41 @@ def run_pipeline(
             logger.warning(
                 "Webcam 0 is not accessible. Falling back to synthetic test video: datasets/sample_parking.mp4"
             )
-            config.source = str(sample_video_path)
+            cam_config.source = str(sample_video_path)
 
-    logger.info("=" * 65)
-    logger.info("   SMART PARKING AI - COMPUTER VISION CAMERA PIPELINE   ")
-    logger.info(f"   Target Source     : {config.source}")
-    logger.info(f"   Target Resolution : {config.width}x{config.height}")
-    logger.info(f"   Frame Skip Factor : {config.frame_skip}")
-    logger.info(f"   Display Mode      : {'Headless' if headless else 'Interactive GUI'}")
-    logger.info("=" * 65)
+    # 2. Initialize Detection Configuration & Model
+    detector = None
+    if enable_detection:
+        det_config = DetectionConfig.from_env()
+        if model_path:
+            det_config.model_path = model_path
+        det_config.confidence_threshold = conf_thresh
+        det_config.iou_threshold = iou_thresh
+        det_config.image_size = image_size
+        detector = YOLOVehicleDetector(det_config)
+
+    logger.info("=" * 68)
+    logger.info("   SMART PARKING AI - YOLO VEHICLE DETECTION PIPELINE   ")
+    logger.info(f"   Target Source       : {cam_config.source}")
+    logger.info(f"   Target Resolution   : {cam_config.width}x{cam_config.height}")
+    logger.info(f"   Detection Enabled   : {enable_detection}")
+    if enable_detection and detector:
+        logger.info(f"   YOLO Model Weight   : {detector.config.model_path}")
+        logger.info(f"   Confidence Thresh   : {detector.config.confidence_threshold}")
+        logger.info(f"   NMS IoU Thresh      : {detector.config.iou_threshold}")
+        logger.info(f"   Inference Image Sz  : {detector.config.image_size}")
+        logger.info(f"   Inference Device    : {detector.config.device}")
+    logger.info(f"   Display Mode        : {'Headless' if headless else 'Interactive GUI'}")
+    logger.info("=" * 68)
 
     fps_meter = FPSMeter(window_size=30)
-    window_name = "Smart Parking AI - Live Camera Stream (Phase 2)"
+    window_name = "Smart Parking AI - YOLO Vehicle Detection (Phase 3)"
+
+    total_inf_time = 0.0
+    detected_frames_count = 0
 
     try:
-        with VideoCamera(config) as camera:
+        with VideoCamera(cam_config) as camera:
             frame_idx = 0
             is_paused = False
 
@@ -85,34 +116,50 @@ def run_pipeline(
                         logger.info("Stream ended or failed to capture frame. Exiting loop.")
                         break
 
+                    inference_ms = 0.0
+                    detections = []
+                    summary = None
+
+                    # Run YOLO Vehicle Detection
+                    if detector is not None:
+                        detections, inference_ms = detector.detect(frame)
+                        total_inf_time += inference_ms
+                        detected_frames_count += 1
+                        summary = get_detection_summary(detections)
+
+                        # Draw Bounding Boxes and Labels
+                        draw_detections(frame, detections, show_footprint=True)
+
                     # Tick FPS meter & calculate performance
                     rolling_fps = fps_meter.tick()
                     latency_ms = fps_meter.latency_ms
                     frame_idx += 1
 
-                    # Overlay engineering HUD
+                    # Overlay engineering telemetry HUD
                     annotated_frame = draw_telemetry_hud(
                         frame=frame,
                         fps=fps_meter.fps,
                         latency_ms=latency_ms,
                         frame_idx=frame_idx,
                         source_name=camera.source_type,
-                        target_res=(config.width, config.height)
+                        target_res=(cam_config.width, cam_config.height),
+                        inference_ms=inference_ms,
+                        vehicle_counts=summary
                     )
 
-                # Check max_frames termination (for testing / benchmarking)
+                # Check max_frames termination
                 if 0 < max_frames <= frame_idx:
                     logger.info(f"Reached max frame limit ({max_frames} frames). Terminating test.")
                     break
 
                 # Headless Mode (no OpenCV GUI window created)
                 if headless:
-                    if frame_idx % 30 == 0 or frame_idx == 1:
+                    if frame_idx % 10 == 0 or frame_idx == 1:
+                        sum_str = f"Vehicles: {summary['total']}" if summary else "No Detection"
                         logger.info(
-                            f"[Headless] Frame: {frame_idx:05d} | FPS: {fps_meter.fps:5.1f} | Latency: {latency_ms:4.1f}ms | Shape: {frame.shape}"
+                            f"[Headless] Frame: {frame_idx:04d} | FPS: {fps_meter.fps:4.1f} | "
+                            f"Inf: {inference_ms:4.1f}ms | {sum_str}"
                         )
-                    # Yield slightly to avoid 100% CPU lock in headless test
-                    time.sleep(0.005)
                     continue
 
                 # Interactive Mode: Display window via OpenCV
@@ -128,8 +175,8 @@ def run_pipeline(
                     logger.info(f"Stream {'PAUSED' if is_paused else 'RESUMED'}")
                 elif key == ord('s'):  # 's' saves snapshot
                     snap_path = PROJECT_ROOT / "datasets" / f"snapshot_{int(time.time())}.jpg"
-                    cv2.imwrite(str(snap_path), frame)
-                    logger.info(f"Snapshot saved: {snap_path}")
+                    cv2.imwrite(str(snap_path), annotated_frame)
+                    logger.info(f"Annotated snapshot saved: {snap_path}")
 
     except KeyboardInterrupt:
         logger.info("Pipeline terminated by KeyboardInterrupt.")
@@ -137,20 +184,27 @@ def run_pipeline(
         if not headless:
             cv2.destroyAllWindows()
 
-    logger.info("=" * 65)
+    avg_inf = (total_inf_time / detected_frames_count) if detected_frames_count > 0 else 0.0
+    logger.info("=" * 68)
     logger.info(f"Pipeline Completed: {frame_idx} total frames processed.")
-    logger.info(f"Average Rolling FPS : {fps_meter.fps:.2f}")
-    logger.info(f"Total Session Time  : {fps_meter.uptime_sec:.2f} seconds")
-    logger.info("=" * 65)
+    logger.info(f"Average Rolling FPS       : {fps_meter.fps:.2f}")
+    logger.info(f"Average YOLO Inference    : {avg_inf:.2f} ms")
+    logger.info(f"Total Session Time        : {fps_meter.uptime_sec:.2f} seconds")
+    logger.info("=" * 68)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Smart Parking AI - Phase 2 Camera Pipeline")
+    parser = argparse.ArgumentParser(description="Smart Parking AI - Phase 3 YOLO Vehicle Detection")
     parser.add_argument("--source", type=str, default=None, help="Camera device index (0), video path, or RTSP URL")
     parser.add_argument("--width", type=int, default=1280, help="Target frame width (default: 1280)")
     parser.add_argument("--height", type=int, default=720, help="Target frame height (default: 720)")
     parser.add_argument("--skip", type=int, default=0, help="Frames to skip between inferences (default: 0)")
-    parser.add_argument("--headless", action="store_true", help="Run without opening GUI window (for testing/CI)")
+    parser.add_argument("--model", type=str, default="yolov8n.pt", help="YOLO model path/name (default: yolov8n.pt)")
+    parser.add_argument("--conf", type=float, default=0.45, help="Confidence threshold (default: 0.45)")
+    parser.add_argument("--iou", type=float, default=0.45, help="NMS IoU threshold (default: 0.45)")
+    parser.add_argument("--imgsz", type=int, default=640, help="YOLO input image size (default: 640)")
+    parser.add_argument("--no-detect", action="store_true", help="Disable YOLO detection (camera-only mode)")
+    parser.add_argument("--headless", action="store_true", help="Run in headless mode without GUI window")
     parser.add_argument("--max-frames", type=int, default=0, help="Stop after N frames (default: 0 = infinite)")
 
     args = parser.parse_args()
@@ -159,6 +213,11 @@ def main():
         width=args.width,
         height=args.height,
         frame_skip=args.skip,
+        model_path=args.model,
+        conf_thresh=args.conf,
+        iou_thresh=args.iou,
+        image_size=args.imgsz,
+        enable_detection=not args.no_detect,
         headless=args.headless,
         max_frames=args.max_frames
     )

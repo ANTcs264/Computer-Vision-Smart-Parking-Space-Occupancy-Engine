@@ -5,6 +5,7 @@ Provides high-precision FPS metering, latency calculation, and telemetry renderi
 
 import time
 from collections import deque
+from typing import Dict, Optional, Tuple
 import cv2
 import numpy as np
 
@@ -73,47 +74,62 @@ def draw_telemetry_hud(
     latency_ms: float,
     frame_idx: int,
     source_name: str,
-    target_res: tuple[int, int]
+    target_res: Tuple[int, int],
+    inference_ms: float = 0.0,
+    vehicle_counts: Optional[Dict[str, int]] = None
 ) -> np.ndarray:
     """
-    Draws a semi-transparent engineering telemetry HUD on the top of the video frame.
-    Displays: Status, Resolution, FPS, Latency, Frame Counter, and Timestamp.
+    Draws a semi-transparent engineering telemetry HUD on the video frame.
+    Displays: Status, Resolution, FPS, Latency, YOLO Inference Time, Vehicle Counts, Frame Counter.
     """
     h, w = frame.shape[:2]
     overlay = frame.copy()
 
-    # Draw semi-transparent header bar across the top
-    banner_height = 42
+    # Draw semi-transparent header bar across the top (double height if detections enabled)
+    banner_height = 68 if inference_ms > 0 else 42
     cv2.rectangle(overlay, (0, 0), (w, banner_height), (15, 23, 42), -1)  # Dark slate gray
     cv2.addWeighted(overlay, 0.85, frame, 0.15, 0, frame)
 
     # Accent color line
     cv2.line(frame, (0, banner_height), (w, banner_height), (34, 197, 94), 2)  # Green accent line
 
-    # Prepare status text
+    # Line 1: Primary Stream Telemetry
     status_text = f"STREAM: [{source_name.upper()}]"
     res_text = f"RES: {w}x{h}"
     fps_color = (34, 197, 94) if fps >= 20 else (0, 165, 255) if fps >= 10 else (0, 0, 255)
     fps_text = f"FPS: {fps:5.1f}"
-    lat_text = f"LATENCY: {latency_ms:4.1f}ms"
+    lat_text = f"LOOP: {latency_ms:4.1f}ms"
     frame_text = f"FRAME: {frame_idx:06d}"
 
     font = cv2.FONT_HERSHEY_SIMPLEX
-    font_scale = 0.52
+    font_scale = 0.50
     thickness = 1
 
-    # Text placements
-    cv2.putText(frame, status_text, (15, 26), font, font_scale, (241, 245, 249), thickness, cv2.LINE_AA)
-    cv2.putText(frame, res_text, (240, 26), font, font_scale, (148, 163, 184), thickness, cv2.LINE_AA)
-    cv2.putText(frame, fps_text, (400, 26), font, font_scale, fps_color, 2, cv2.LINE_AA)
-    cv2.putText(frame, lat_text, (530, 26), font, font_scale, (203, 213, 225), thickness, cv2.LINE_AA)
-    cv2.putText(frame, frame_text, (710, 26), font, font_scale, (148, 163, 184), thickness, cv2.LINE_AA)
+    cv2.putText(frame, status_text, (15, 24), font, font_scale, (241, 245, 249), thickness, cv2.LINE_AA)
+    cv2.putText(frame, res_text, (240, 24), font, font_scale, (148, 163, 184), thickness, cv2.LINE_AA)
+    cv2.putText(frame, fps_text, (380, 24), font, font_scale, fps_color, 2, cv2.LINE_AA)
+    cv2.putText(frame, lat_text, (500, 24), font, font_scale, (203, 213, 225), thickness, cv2.LINE_AA)
+    cv2.putText(frame, frame_text, (650, 24), font, font_scale, (148, 163, 184), thickness, cv2.LINE_AA)
+
+    # Line 2: AI Inference & Vehicle Detection Metrics
+    if inference_ms > 0:
+        yolo_text = f"YOLO INFERENCE: {inference_ms:4.1f}ms"
+        cv2.putText(frame, yolo_text, (15, 52), font, font_scale, (250, 204, 21), 1, cv2.LINE_AA)
+
+        if vehicle_counts is not None:
+            total_v = vehicle_counts.get("total", 0)
+            cars = vehicle_counts.get("car", 0)
+            trucks = vehicle_counts.get("truck", 0)
+            motorcycles = vehicle_counts.get("motorcycle", 0)
+            buses = vehicle_counts.get("bus", 0)
+            count_str = f"VEHICLES DETECTED: {total_v} (Cars: {cars}, Trucks: {trucks}, Moto: {motorcycles}, Buses: {buses})"
+            cv2.putText(frame, count_str, (240, 52), font, font_scale, (226, 232, 240), 1, cv2.LINE_AA)
 
     # Bottom helper bar
     help_overlay = frame.copy()
     cv2.rectangle(help_overlay, (0, h - 28), (w, h), (15, 23, 42), -1)
     cv2.addWeighted(help_overlay, 0.75, frame, 0.25, 0, frame)
-    help_text = "Press 'q' or 'ESC' to exit | Smart Parking AI - CV Pipeline (Phase 2)"
+    help_text = "Press 'q' or 'ESC' to exit | 'p' to pause | 's' for snapshot | Smart Parking AI - YOLO Vehicle Detection"
     cv2.putText(frame, help_text, (15, h - 9), font, 0.44, (203, 213, 225), 1, cv2.LINE_AA)
 
     return frame

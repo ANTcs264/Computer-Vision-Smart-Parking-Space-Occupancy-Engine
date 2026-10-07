@@ -2,13 +2,14 @@
 Parking Occupancy Engine Module
 Evaluates geometric spatial intersections, ground footprint containment,
 and dual-threshold temporal hysteresis smoothing to determine slot occupancy.
+Associates persistent ByteTrack Vehicle IDs with occupied slots.
 """
 
 from collections import deque
 from dataclasses import dataclass, field
 import logging
 import time
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from shapely.geometry import Point, box
 
 from cv_engine.detection import Detection
@@ -38,26 +39,23 @@ class SlotStateTransition:
     confidence: float
     dwell_duration_sec: float = 0.0
     matched_class: str = ""
+    vehicle_id: Optional[int] = None
 
 
 class OccupancyEngine:
     """
     Core Intelligence Engine.
-    Maps localized vehicle detections to parking slots and applies temporal smoothing
-    to eliminate flicker.
+    Maps localized vehicle detections to parking slots, associates persistent vehicle IDs,
+    and applies temporal smoothing to eliminate flicker.
     """
 
     def __init__(self, slot_manager: SlotManager, config: Optional[OccupancyConfig] = None):
         self.slot_manager = slot_manager
         self.config = config or OccupancyConfig()
 
-        # State tracking per slot: {slot_id: deque(maxlen=hysteresis_window)}
         self._history: Dict[str, deque] = {}
-        # Timestamps of last status change: {slot_id: float}
         self._status_change_time: Dict[str, float] = {}
-        # Timestamps when slot became occupied: {slot_id: float}
         self._occupied_since: Dict[str, Optional[float]] = {}
-        # Active matched vehicle info: {slot_id: Dict}
         self._active_matches: Dict[str, Dict] = {}
 
         now = time.time()
@@ -65,14 +63,14 @@ class OccupancyEngine:
             self._history[slot.slot_id] = deque(maxlen=self.config.hysteresis_window)
             self._status_change_time[slot.slot_id] = now
             self._occupied_since[slot.slot_id] = now if slot.status == "OCCUPIED" else None
-            self._active_matches[slot.slot_id] = {"class": "", "conf": 0.0}
+            self._active_matches[slot.slot_id] = {"class": "", "conf": 0.0, "vehicle_id": None}
 
-    def update(self, detections: List[Detection]) -> List[SlotStateTransition]:
+    def update(self, detections: List[Any]) -> List[SlotStateTransition]:
         """
-        Evaluates current frame detections against all parking slots.
+        Evaluates current frame detections or tracked vehicles against all parking slots.
         
         Args:
-            detections: List of localized vehicles detected by YOLO.
+            detections: List of Detection or TrackedVehicle instances.
             
         Returns:
             List of confirmed state transition events (e.g. AVAILABLE -> OCCUPIED).
@@ -86,17 +84,16 @@ class OccupancyEngine:
                 self._history[slot_id] = deque(maxlen=self.config.hysteresis_window)
                 self._status_change_time[slot_id] = now
                 self._occupied_since[slot_id] = None
-                self._active_matches[slot_id] = {"class": "", "conf": 0.0}
+                self._active_matches[slot_id] = {"class": "", "conf": 0.0, "vehicle_id": None}
 
             # 1. Spatial Intersection Check
-            is_raw_present, best_conf, best_class, best_overlap = self._check_spatial_overlap(slot, detections)
+            is_raw_present, best_conf, best_class, best_overlap, best_vid = self._check_spatial_overlap(slot, detections)
 
             # 2. Record raw frame observation into rolling hysteresis buffer
             history = self._history[slot_id]
             history.append(1 if is_raw_present else 0)
 
             # 3. Calculate positive observation ratio normalized over the fixed hysteresis window
-            # Normalizing by hysteresis_window prevents single-frame cold-start false positives
             positives = sum(history)
             presence_ratio = positives / self.config.hysteresis_window
 
@@ -106,30 +103,40 @@ class OccupancyEngine:
 
             # 4. Temporal State Machine (Dual-Threshold Hysteresis)
             if current_status == "AVAILABLE":
-                # Only transition to OCCUPIED if positive detections exceed the occupied ratio
                 if presence_ratio >= self.config.occupied_ratio:
                     target_status = "OCCUPIED"
                     self._occupied_since[slot_id] = now
                     dwell_duration = 0.0
-                    self._active_matches[slot_id] = {"class": best_class, "conf": best_conf}
+                    self._active_matches[slot_id] = {
+                        "class": best_class,
+                        "conf": best_conf,
+                        "vehicle_id": best_vid
+                    }
+                    slot.assigned_vehicle_id = best_vid
 
             elif current_status == "OCCUPIED":
-                # Only transition back to AVAILABLE if presence drops below vacated ratio
                 if presence_ratio <= self.config.vacated_ratio:
                     target_status = "AVAILABLE"
                     if self._occupied_since[slot_id] is not None:
                         dwell_duration = now - self._occupied_since[slot_id]
                     self._occupied_since[slot_id] = None
-                    self._active_matches[slot_id] = {"class": "", "conf": 0.0}
+                    self._active_matches[slot_id] = {"class": "", "conf": 0.0, "vehicle_id": None}
+                    slot.assigned_vehicle_id = None
                 else:
-                    # Maintain occupancy & update dwell info
                     if is_raw_present:
-                        self._active_matches[slot_id] = {"class": best_class, "conf": best_conf}
+                        self._active_matches[slot_id] = {
+                            "class": best_class,
+                            "conf": best_conf,
+                            "vehicle_id": best_vid
+                        }
+                        if best_vid is not None:
+                            slot.assigned_vehicle_id = best_vid
 
             # 5. Handle State Transition
             if target_status != current_status:
+                vid_str = f" [Vehicle ID: {best_vid}]" if best_vid is not None else ""
                 logger.info(
-                    f"[Occupancy] Slot {slot_id}: {current_status} -> {target_status} "
+                    f"[Occupancy] Slot {slot_id}: {current_status} -> {target_status}{vid_str} "
                     f"(Positive ratio: {presence_ratio:.2f}, Overlap: {best_overlap:.2f})"
                 )
                 slot.status = target_status
@@ -143,7 +150,8 @@ class OccupancyEngine:
                     timestamp=now,
                     confidence=best_conf,
                     dwell_duration_sec=dwell_duration,
-                    matched_class=best_class
+                    matched_class=best_class,
+                    vehicle_id=best_vid
                 )
                 transitions.append(transition)
 
@@ -152,16 +160,18 @@ class OccupancyEngine:
     def _check_spatial_overlap(
         self,
         slot: ParkingSlot,
-        detections: List[Detection]
-    ) -> Tuple[bool, float, str, float]:
+        detections: List[Any]
+    ) -> Tuple[bool, float, str, float, Optional[int]]:
         """
         Determines whether any detection matches the slot using:
         1. Ground Footprint Point Containment (primary)
         2. Polygonal Overlap Ratio (secondary fallback)
+        Extracts persistent vehicle track ID if present.
         """
         best_overlap = 0.0
         best_conf = 0.0
         best_class = ""
+        best_vid = None
         is_present = False
 
         slot_poly = slot.shapely_polygon
@@ -186,9 +196,10 @@ class OccupancyEngine:
                     best_overlap = overlap_ratio
                     best_conf = det.confidence
                     best_class = det.class_name
+                    best_vid = getattr(det, "track_id", None)
                     is_present = True
 
-        return is_present, best_conf, best_class, best_overlap
+        return is_present, best_conf, best_class, best_overlap, best_vid
 
     def get_slot_telemetry(self, slot_id: str) -> Dict:
         """Returns diagnostic telemetry for an individual slot."""
@@ -205,5 +216,6 @@ class OccupancyEngine:
             "window_size": len(history),
             "matched_class": match.get("class", ""),
             "confidence": match.get("conf", 0.0),
+            "vehicle_id": match.get("vehicle_id"),
             "dwell_sec": dwell
         }

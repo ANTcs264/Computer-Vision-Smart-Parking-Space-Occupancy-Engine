@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Computer Vision Engine - Phase 5 Unified Pipeline
-Camera Ingestion + YOLO Multi-Class Detection + Real-time Parking Occupancy Engine.
-Features Ground Footprint Containment, Polygon Overlap, and Temporal Hysteresis Filtering.
+Computer Vision Engine - Phase 6 Unified Pipeline
+Camera Ingestion + YOLO Detection + ByteTrack Multi-Vehicle Tracking
++ Directional Entry/Exit Counting + Real-time Parking Occupancy Engine.
 """
 
 import argparse
@@ -19,17 +19,17 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from cv_engine.camera import CameraConfig, FPSMeter, VideoCamera, draw_telemetry_hud
-from cv_engine.detection import (
-    DetectionConfig,
-    YOLOVehicleDetector,
-    draw_detections,
-    get_detection_summary
-)
+from cv_engine.detection import DetectionConfig, YOLOVehicleDetector
 from cv_engine.parking import (
     SlotManager,
     OccupancyEngine,
     OccupancyConfig,
     DEFAULT_SLOTS_FILE
+)
+from cv_engine.tracking import (
+    VehicleTracker,
+    CountingTripwire,
+    VehicleFlowCounter
 )
 
 # Configure structured logging
@@ -53,12 +53,12 @@ def run_pipeline(
     slots_path: str | None = str(DEFAULT_SLOTS_FILE),
     overlap_thresh: float = 0.28,
     hysteresis_window: int = 30,
-    enable_detection: bool = True,
+    enable_tracking: bool = True,
     headless: bool = False,
     max_frames: int = 0
 ):
     """
-    Main CV processing loop integrating Camera, YOLO Detection, and Parking Occupancy Engine.
+    Main unified CV pipeline integrating Camera, YOLO, ByteTrack, Flow Counting, and Occupancy.
     """
     # 1. Initialize Camera Configuration
     cam_config = CameraConfig.from_env()
@@ -70,7 +70,6 @@ def run_pipeline(
         cam_config.height = height
     cam_config.frame_skip = frame_skip
 
-    # Fallback to sample parking video if webcam 0 requested but unavailable
     sample_video_path = PROJECT_ROOT / "datasets" / "sample_parking.mp4"
     if cam_config.source == 0:
         test_cap = cv2.VideoCapture(0)
@@ -82,18 +81,23 @@ def run_pipeline(
             )
             cam_config.source = str(sample_video_path)
 
-    # 2. Initialize YOLO Vehicle Detector
-    detector = None
-    if enable_detection:
-        det_config = DetectionConfig.from_env()
-        if model_path:
-            det_config.model_path = model_path
-        det_config.confidence_threshold = conf_thresh
-        det_config.iou_threshold = iou_thresh
-        det_config.image_size = image_size
-        detector = YOLOVehicleDetector(det_config)
+    # 2. Initialize YOLO Detector & ByteTrack Tracker
+    det_config = DetectionConfig.from_env()
+    if model_path:
+        det_config.model_path = model_path
+    det_config.confidence_threshold = conf_thresh
+    det_config.iou_threshold = iou_thresh
+    det_config.image_size = image_size
 
-    # 3. Initialize Parking Slot Manager & Occupancy Engine
+    detector = YOLOVehicleDetector(det_config)
+    tracker = VehicleTracker(detector.model, det_config) if enable_tracking else None
+
+    # 3. Initialize Flow Counter with Main Driveway Tripwire
+    flow_counter = VehicleFlowCounter(tripwires=[
+        CountingTripwire("MAIN DRIVEWAY", pt1=(80, 360), pt2=(1200, 360))
+    ])
+
+    # 4. Initialize Parking Slot Manager & Occupancy Engine
     slot_manager = None
     occupancy_engine = None
     active_slots_file = slots_path if (slots_path and os.path.isfile(slots_path)) else DEFAULT_SLOTS_FILE
@@ -109,23 +113,20 @@ def run_pipeline(
         occupancy_engine = OccupancyEngine(slot_manager, occ_config)
 
     logger.info("=" * 68)
-    logger.info("   SMART PARKING AI - PHASE 5 PARKING OCCUPANCY ENGINE   ")
+    logger.info("   SMART PARKING AI - PHASE 6 VEHICLE TRACKING & COUNTING   ")
     logger.info(f"   Target Source       : {cam_config.source}")
     logger.info(f"   Target Resolution   : {cam_config.width}x{cam_config.height}")
-    logger.info(f"   Detection Enabled   : {enable_detection}")
-    if slot_manager and occupancy_engine:
+    logger.info(f"   ByteTrack Tracker   : {'Active' if tracker else 'Disabled'}")
+    if slot_manager:
         logger.info(f"   Occupancy Engine    : Active ({slot_manager.total_count} slots loaded)")
-        logger.info(f"   Hysteresis Window   : {occupancy_engine.config.hysteresis_window} frames")
-        logger.info(f"   Overlap Threshold   : {occupancy_engine.config.overlap_threshold * 100:.0f}%")
     logger.info(f"   Display Mode        : {'Headless' if headless else 'Interactive GUI'}")
     logger.info("=" * 68)
 
     fps_meter = FPSMeter(window_size=30)
-    window_name = "Smart Parking AI - Occupancy Engine (Phase 5)"
+    window_name = "Smart Parking AI - ByteTrack Vehicle Tracking (Phase 6)"
 
-    total_inf_time = 0.0
-    detected_frames_count = 0
-    total_transitions_logged = 0
+    total_track_time = 0.0
+    tracked_frames_count = 0
 
     try:
         with VideoCamera(cam_config) as camera:
@@ -140,40 +141,53 @@ def run_pipeline(
                         break
 
                     inference_ms = 0.0
-                    detections = []
-                    summary = None
+                    tracked_vehicles = []
 
-                    # Step 1: Run YOLO Detection
-                    if detector is not None:
-                        detections, inference_ms = detector.detect(frame)
-                        total_inf_time += inference_ms
-                        detected_frames_count += 1
-                        summary = get_detection_summary(detections)
+                    # Step 1: Run ByteTrack Vehicle Tracking
+                    if tracker is not None:
+                        tracked_vehicles, inference_ms = tracker.track(frame)
+                        total_track_time += inference_ms
+                        tracked_frames_count += 1
 
-                    # Step 2: Run Parking Occupancy Engine (Temporal Smoothing)
+                        # Step 2: Update Directional Entry/Exit Counting
+                        flow_counter.update(tracked_vehicles)
+
+                    # Step 3: Run Parking Occupancy Engine (Map Vehicles to Slots)
                     if occupancy_engine is not None:
-                        transitions = occupancy_engine.update(detections)
+                        transitions = occupancy_engine.update(tracked_vehicles)
                         for t in transitions:
-                            total_transitions_logged += 1
+                            vid_msg = f" by Vehicle ID {t.vehicle_id}" if t.vehicle_id is not None else ""
                             dwell_msg = f" (Dwell: {t.dwell_duration_sec:.1f}s)" if t.new_status == "AVAILABLE" else ""
                             logger.info(
-                                f"🔔 STATE CHANGE: Slot {t.slot_id} -> {t.new_status}{dwell_msg} "
-                                f"[Conf: {t.confidence:.2f}, Vehicle: {t.matched_class.upper()}]"
+                                f"🔔 STATE CHANGE: Slot {t.slot_id} -> {t.new_status}{vid_msg}{dwell_msg} "
+                                f"[Conf: {t.confidence:.2f}, Type: {t.matched_class.upper()}]"
                             )
 
-                    # Step 3: Draw Slot Overlays (Green = AVAILABLE, Red = OCCUPIED)
+                    # Step 4: Render Parking Slots & KPI Banner
                     if slot_manager is not None:
                         slot_manager.draw_slots(frame, alpha=0.30)
                         slot_manager.draw_slot_kpi_banner(frame)
 
-                    # Step 4: Draw Detections & Footprint Points
-                    if detector is not None:
-                        draw_detections(frame, detections, show_footprint=True)
+                    # Step 5: Render Directional Counting Tripwires
+                    flow_counter.draw(frame)
+
+                    # Step 6: Render Tracked Vehicles with IDs & Trajectory Trails
+                    if tracker is not None:
+                        tracker.draw_tracked_vehicles(frame, tracked_vehicles)
 
                     # Tick FPS meter & calculate performance
                     rolling_fps = fps_meter.tick()
                     latency_ms = fps_meter.latency_ms
                     frame_idx += 1
+
+                    # Telemetry summary
+                    summary = {
+                        "total": len(tracked_vehicles),
+                        "car": sum(1 for v in tracked_vehicles if v.class_name == "car"),
+                        "truck": sum(1 for v in tracked_vehicles if v.class_name == "truck"),
+                        "motorcycle": sum(1 for v in tracked_vehicles if v.class_name == "motorcycle"),
+                        "bus": sum(1 for v in tracked_vehicles if v.class_name == "bus"),
+                    }
 
                     # Overlay engineering telemetry HUD
                     annotated_frame = draw_telemetry_hud(
@@ -192,23 +206,19 @@ def run_pipeline(
                     logger.info(f"Reached max frame limit ({max_frames} frames). Terminating test.")
                     break
 
-                # Headless Mode (for tests / CI)
+                # Headless Mode
                 if headless:
                     if frame_idx % 10 == 0 or frame_idx == 1:
-                        occ_info = (
-                            f"Occupied: {slot_manager.occupied_count}/{slot_manager.total_count} ({slot_manager.occupancy_rate:.0f}%)"
-                            if slot_manager else "No Slots"
-                        )
                         logger.info(
                             f"[Headless] Frame: {frame_idx:04d} | FPS: {fps_meter.fps:4.1f} | "
-                            f"Inf: {inference_ms:4.1f}ms | {occ_info}"
+                            f"Track: {inference_ms:4.1f}ms | Active: {len(tracked_vehicles)} | "
+                            f"In: {flow_counter.total_entry_count} | Out: {flow_counter.total_exit_count}"
                         )
                     continue
 
                 # Interactive Mode: Display window via OpenCV
                 cv2.imshow(window_name, annotated_frame)
 
-                # Keyboard controls
                 key = cv2.waitKey(1) & 0xFF
                 if key in (ord('q'), 27):  # 'q' or ESC
                     logger.info("Exit requested by user.")
@@ -227,21 +237,20 @@ def run_pipeline(
         if not headless:
             cv2.destroyAllWindows()
 
-    avg_inf = (total_inf_time / detected_frames_count) if detected_frames_count > 0 else 0.0
+    avg_track = (total_track_time / tracked_frames_count) if tracked_frames_count > 0 else 0.0
     logger.info("=" * 68)
     logger.info(f"Pipeline Completed: {frame_idx} total frames processed.")
-    logger.info(f"Average Rolling FPS       : {fps_meter.fps:.2f}")
-    if enable_detection:
-        logger.info(f"Average YOLO Inference    : {avg_inf:.2f} ms")
-    if slot_manager:
-        logger.info(f"Final Occupancy Status    : {slot_manager.occupied_count}/{slot_manager.total_count} slots occupied ({slot_manager.occupancy_rate:.1f}%)")
-        logger.info(f"Total Transitions Logged  : {total_transitions_logged}")
-    logger.info(f"Total Session Time        : {fps_meter.uptime_sec:.2f} seconds")
+    logger.info(f"Average Rolling FPS          : {fps_meter.fps:.2f}")
+    logger.info(f"Average ByteTrack Latency    : {avg_track:.2f} ms")
+    logger.info(f"Total Unique Vehicles Tracked: {flow_counter.total_unique_vehicles}")
+    logger.info(f"Total Gate Entries           : {flow_counter.total_entry_count}")
+    logger.info(f"Total Gate Exits             : {flow_counter.total_exit_count}")
+    logger.info(f"Total Session Time           : {fps_meter.uptime_sec:.2f} seconds")
     logger.info("=" * 68)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Smart Parking AI - Phase 5 Parking Occupancy Engine")
+    parser = argparse.ArgumentParser(description="Smart Parking AI - Phase 6 ByteTrack Pipeline")
     parser.add_argument("--source", type=str, default=None, help="Camera device index (0), video path, or RTSP URL")
     parser.add_argument("--width", type=int, default=1280, help="Target frame width (default: 1280)")
     parser.add_argument("--height", type=int, default=720, help="Target frame height (default: 720)")
@@ -253,7 +262,7 @@ def main():
     parser.add_argument("--slots", type=str, default=str(DEFAULT_SLOTS_FILE), help="Path to parking_slots.json")
     parser.add_argument("--overlap", type=float, default=0.28, help="Slot overlap threshold (default: 0.28)")
     parser.add_argument("--hysteresis", type=int, default=30, help="Temporal hysteresis window size (default: 30)")
-    parser.add_argument("--no-detect", action="store_true", help="Disable YOLO detection")
+    parser.add_argument("--no-track", action="store_true", help="Disable vehicle tracking")
     parser.add_argument("--headless", action="store_true", help="Run in headless mode without GUI window")
     parser.add_argument("--max-frames", type=int, default=0, help="Stop after N frames (default: 0 = infinite)")
 
@@ -270,7 +279,7 @@ def main():
         slots_path=args.slots,
         overlap_thresh=args.overlap,
         hysteresis_window=args.hysteresis,
-        enable_detection=not args.no_detect,
+        enable_tracking=not args.no_track,
         headless=args.headless,
         max_frames=args.max_frames
     )

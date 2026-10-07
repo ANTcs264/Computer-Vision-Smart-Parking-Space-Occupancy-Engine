@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-Computer Vision Engine - Phase 4 Unified Pipeline
-Camera Ingestion + YOLO Multi-Class Detection + Parking Slot Map Overlay.
+Computer Vision Engine - Phase 5 Unified Pipeline
+Camera Ingestion + YOLO Multi-Class Detection + Real-time Parking Occupancy Engine.
+Features Ground Footprint Containment, Polygon Overlap, and Temporal Hysteresis Filtering.
 """
 
 import argparse
@@ -24,7 +25,12 @@ from cv_engine.detection import (
     draw_detections,
     get_detection_summary
 )
-from cv_engine.parking import SlotManager, DEFAULT_SLOTS_FILE
+from cv_engine.parking import (
+    SlotManager,
+    OccupancyEngine,
+    OccupancyConfig,
+    DEFAULT_SLOTS_FILE
+)
 
 # Configure structured logging
 logging.basicConfig(
@@ -45,12 +51,14 @@ def run_pipeline(
     iou_thresh: float = 0.45,
     image_size: int = 640,
     slots_path: str | None = str(DEFAULT_SLOTS_FILE),
+    overlap_thresh: float = 0.28,
+    hysteresis_window: int = 30,
     enable_detection: bool = True,
     headless: bool = False,
     max_frames: int = 0
 ):
     """
-    Main CV processing loop integrating Camera, YOLO Detection, and Parking Slot Overlays.
+    Main CV processing loop integrating Camera, YOLO Detection, and Parking Occupancy Engine.
     """
     # 1. Initialize Camera Configuration
     cam_config = CameraConfig.from_env()
@@ -62,7 +70,7 @@ def run_pipeline(
         cam_config.height = height
     cam_config.frame_skip = frame_skip
 
-    # Fallback to sample parking video if webcam 0 is requested but not available
+    # Fallback to sample parking video if webcam 0 requested but unavailable
     sample_video_path = PROJECT_ROOT / "datasets" / "sample_parking.mp4"
     if cam_config.source == 0:
         test_cap = cv2.VideoCapture(0)
@@ -74,7 +82,7 @@ def run_pipeline(
             )
             cam_config.source = str(sample_video_path)
 
-    # 2. Initialize YOLO Detector
+    # 2. Initialize YOLO Vehicle Detector
     detector = None
     if enable_detection:
         det_config = DetectionConfig.from_env()
@@ -85,28 +93,39 @@ def run_pipeline(
         det_config.image_size = image_size
         detector = YOLOVehicleDetector(det_config)
 
-    # 3. Initialize Parking Slot Manager
+    # 3. Initialize Parking Slot Manager & Occupancy Engine
     slot_manager = None
-    if slots_path and os.path.isfile(slots_path):
-        slot_manager = SlotManager(slots_path)
-    elif DEFAULT_SLOTS_FILE.is_file():
-        slot_manager = SlotManager(DEFAULT_SLOTS_FILE)
+    occupancy_engine = None
+    active_slots_file = slots_path if (slots_path and os.path.isfile(slots_path)) else DEFAULT_SLOTS_FILE
+
+    if os.path.isfile(active_slots_file):
+        slot_manager = SlotManager(active_slots_file)
+        occ_config = OccupancyConfig(
+            overlap_threshold=overlap_thresh,
+            hysteresis_window=hysteresis_window,
+            occupied_ratio=0.65,
+            vacated_ratio=0.20
+        )
+        occupancy_engine = OccupancyEngine(slot_manager, occ_config)
 
     logger.info("=" * 68)
-    logger.info("   SMART PARKING AI - PHASE 4 CAMERA & PARKING SLOT MAP   ")
+    logger.info("   SMART PARKING AI - PHASE 5 PARKING OCCUPANCY ENGINE   ")
     logger.info(f"   Target Source       : {cam_config.source}")
     logger.info(f"   Target Resolution   : {cam_config.width}x{cam_config.height}")
     logger.info(f"   Detection Enabled   : {enable_detection}")
-    if slot_manager:
-        logger.info(f"   Parking Slots Loaded: {slot_manager.total_count} slots from {slot_manager.config_path.name}")
+    if slot_manager and occupancy_engine:
+        logger.info(f"   Occupancy Engine    : Active ({slot_manager.total_count} slots loaded)")
+        logger.info(f"   Hysteresis Window   : {occupancy_engine.config.hysteresis_window} frames")
+        logger.info(f"   Overlap Threshold   : {occupancy_engine.config.overlap_threshold * 100:.0f}%")
     logger.info(f"   Display Mode        : {'Headless' if headless else 'Interactive GUI'}")
     logger.info("=" * 68)
 
     fps_meter = FPSMeter(window_size=30)
-    window_name = "Smart Parking AI - Camera & Parking Slot Map (Phase 4)"
+    window_name = "Smart Parking AI - Occupancy Engine (Phase 5)"
 
     total_inf_time = 0.0
     detected_frames_count = 0
+    total_transitions_logged = 0
 
     try:
         with VideoCamera(cam_config) as camera:
@@ -124,19 +143,31 @@ def run_pipeline(
                     detections = []
                     summary = None
 
-                    # Step 1: Draw Configured Parking Slot Boundaries
-                    if slot_manager is not None:
-                        slot_manager.draw_slots(frame, alpha=0.30)
-                        slot_manager.draw_slot_kpi_banner(frame)
-
-                    # Step 2: Run YOLO Vehicle Detection
+                    # Step 1: Run YOLO Detection
                     if detector is not None:
                         detections, inference_ms = detector.detect(frame)
                         total_inf_time += inference_ms
                         detected_frames_count += 1
                         summary = get_detection_summary(detections)
 
-                        # Draw Bounding Boxes and Ground Footprints
+                    # Step 2: Run Parking Occupancy Engine (Temporal Smoothing)
+                    if occupancy_engine is not None:
+                        transitions = occupancy_engine.update(detections)
+                        for t in transitions:
+                            total_transitions_logged += 1
+                            dwell_msg = f" (Dwell: {t.dwell_duration_sec:.1f}s)" if t.new_status == "AVAILABLE" else ""
+                            logger.info(
+                                f"🔔 STATE CHANGE: Slot {t.slot_id} -> {t.new_status}{dwell_msg} "
+                                f"[Conf: {t.confidence:.2f}, Vehicle: {t.matched_class.upper()}]"
+                            )
+
+                    # Step 3: Draw Slot Overlays (Green = AVAILABLE, Red = OCCUPIED)
+                    if slot_manager is not None:
+                        slot_manager.draw_slots(frame, alpha=0.30)
+                        slot_manager.draw_slot_kpi_banner(frame)
+
+                    # Step 4: Draw Detections & Footprint Points
+                    if detector is not None:
                         draw_detections(frame, detections, show_footprint=True)
 
                     # Tick FPS meter & calculate performance
@@ -164,10 +195,13 @@ def run_pipeline(
                 # Headless Mode (for tests / CI)
                 if headless:
                     if frame_idx % 10 == 0 or frame_idx == 1:
-                        slot_info = f"Slots: {slot_manager.total_count}" if slot_manager else "No Slots"
+                        occ_info = (
+                            f"Occupied: {slot_manager.occupied_count}/{slot_manager.total_count} ({slot_manager.occupancy_rate:.0f}%)"
+                            if slot_manager else "No Slots"
+                        )
                         logger.info(
                             f"[Headless] Frame: {frame_idx:04d} | FPS: {fps_meter.fps:4.1f} | "
-                            f"Inf: {inference_ms:4.1f}ms | {slot_info}"
+                            f"Inf: {inference_ms:4.1f}ms | {occ_info}"
                         )
                     continue
 
@@ -199,12 +233,15 @@ def run_pipeline(
     logger.info(f"Average Rolling FPS       : {fps_meter.fps:.2f}")
     if enable_detection:
         logger.info(f"Average YOLO Inference    : {avg_inf:.2f} ms")
+    if slot_manager:
+        logger.info(f"Final Occupancy Status    : {slot_manager.occupied_count}/{slot_manager.total_count} slots occupied ({slot_manager.occupancy_rate:.1f}%)")
+        logger.info(f"Total Transitions Logged  : {total_transitions_logged}")
     logger.info(f"Total Session Time        : {fps_meter.uptime_sec:.2f} seconds")
     logger.info("=" * 68)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Smart Parking AI - Phase 4 Parking Slot Map Pipeline")
+    parser = argparse.ArgumentParser(description="Smart Parking AI - Phase 5 Parking Occupancy Engine")
     parser.add_argument("--source", type=str, default=None, help="Camera device index (0), video path, or RTSP URL")
     parser.add_argument("--width", type=int, default=1280, help="Target frame width (default: 1280)")
     parser.add_argument("--height", type=int, default=720, help="Target frame height (default: 720)")
@@ -214,7 +251,9 @@ def main():
     parser.add_argument("--iou", type=float, default=0.45, help="NMS IoU threshold (default: 0.45)")
     parser.add_argument("--imgsz", type=int, default=640, help="YOLO input image size (default: 640)")
     parser.add_argument("--slots", type=str, default=str(DEFAULT_SLOTS_FILE), help="Path to parking_slots.json")
-    parser.add_argument("--no-detect", action="store_true", help="Disable YOLO detection (slot-map-only mode)")
+    parser.add_argument("--overlap", type=float, default=0.28, help="Slot overlap threshold (default: 0.28)")
+    parser.add_argument("--hysteresis", type=int, default=30, help="Temporal hysteresis window size (default: 30)")
+    parser.add_argument("--no-detect", action="store_true", help="Disable YOLO detection")
     parser.add_argument("--headless", action="store_true", help="Run in headless mode without GUI window")
     parser.add_argument("--max-frames", type=int, default=0, help="Stop after N frames (default: 0 = infinite)")
 
@@ -229,6 +268,8 @@ def main():
         iou_thresh=args.iou,
         image_size=args.imgsz,
         slots_path=args.slots,
+        overlap_thresh=args.overlap,
+        hysteresis_window=args.hysteresis,
         enable_detection=not args.no_detect,
         headless=args.headless,
         max_frames=args.max_frames
